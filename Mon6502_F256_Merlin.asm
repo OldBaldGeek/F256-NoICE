@@ -27,8 +27,13 @@
 ; It tries to minimize stack usage for the same reason. In some cases
 ; this may result in code that looks clunky. See "HACKBUF" below...
 ;
-; Information about F256jr ports used here is from f256jr_ref.pdf, dated 31-08-2023
-; If a later docuement exists, please let me know.
+; * We use BRK for breakpoints and single-step.
+; * We use NMI to force entry to the monitor. NMI may be caused by a RESTORE
+;   key on a CBM keyboard, or a push-button switch on J5 between RESTORE (pin 3)
+;   and ground (pin 1).
+;
+; Information about F256jr ports used here is from f256jr_ref.pdf,
+; dated 11-12-2023. If a later docuement exists, please let me know.
 ;
 ;============================================================================
         mx      %11
@@ -182,6 +187,9 @@ data_start
 ; (first in segment for easy addressing, else move to their own segment)
 RAMVEC          ds      2*3
 ;
+NMI_NESTING     ds      1       ;poor-man's mutex to control NMI processing
+NMI_COUNT       ds      1       ;Total number of NMI see (for debounce evaluation)
+;
 ; Target registers: order must match that used by NoICE on the PC
 TASK_REGS
 REG_STATE       ds      1
@@ -227,11 +235,6 @@ main_code_start
 ;
 ; Power on reset
 RESET
-
-; TODO: we may need to include a signature of "KERNEL" and some other
-; code from F256_MicroKernel-master\f256\jr.asm
-; If run-from RAM is mediated by the Flash kernel...
-
 ;
 ; Set CPU mode to safe state
         SEI                     ;INTERRUPTS OFF
@@ -240,6 +243,10 @@ RESET
 ; INIT STACK
         LDX     #INITSTACK & $FF
         TXS
+;
+; Ignore any NMI that occur while the monitor is active
+        STZ     NMI_NESTING
+        STZ     NMI_COUNT
 
 ;===========================================================================
 ; INITIALIZE F256jr HARDWARE
@@ -272,15 +279,14 @@ RESET
         JSR     RESTORE_IO      ;2 stack
 
 ;===========================================================================
-; INIT RAM INTERRUPT VECTORS TO DUMMY HANDLERS
-        LDA     #_NMIX & $FF    ;NMI
-        STA     RAMVEC+0
-        LDA     #_NMIX / $100
-        STA     RAMVEC+0+1
-;
-        LDA     #_IRQX & $FF    ;IRQ
+; Set interrupt re-vectors to defaults, in case user doesn't set them.
+;;      LDA     #UNHAN_NMI & $FF    ;NMI
+;;      STA     RAMVEC+0
+;;      LDA     #UNHAN_NMI / $100
+;;      STA     RAMVEC+0+1
+        LDA     #UNHAN_IRQ & $FF    ;IRQ
         STA     RAMVEC+4
-        LDA     #_IRQX / $100
+        LDA     #UNHAN_IRQ / $100
         STA     RAMVEC+4+1
 ;
 ; Initialize user registers
@@ -441,7 +447,7 @@ TSTG_SIZE       EQU     B2-TSTG     ;SIZE OF STRING
 ; - A = interrupt code = processor state
 ; - REG_A has pre-interrupt accumulator
 ; - 3 bytes on stack: PC and CC
-; - Stacked PC points at BRK+2 if BRK, else at PC if entry from interrupt
+; - Stacked PC points at BRK+2 if BRK, else at next instruction if from interrupt
 INT_ENTRY
 ;
 ; Save registers in reg block for return to PC
@@ -458,15 +464,15 @@ INT_ENTRY
         CMP     #1
         BNE     B99             ;BR IF NOT BREAKPOINT: PC IS OK
 ;
-; On the 65C02, BRK leaves PC at break address +2:  back it up by 2
+; On the 65C02, BRK leaves PC at break address +2: back it up to the op-code
         SEC
-        LDA     REG_PC          ;BACK UP PC TO POINT AT BREAKPOINT
+        LDA     REG_PC
         SBC     #2
         STA     REG_PC
         LDA     REG_PC+1
         SBC     #0
         STA     REG_PC+1
-B99     JMP     ENTER_MON       ;REG_PC POINTS AT BREAKPOINT OPCODE
+B99     JMP     ENTER_MON
 ;
 ;===========================================================================
 ;
@@ -480,7 +486,7 @@ MAIN
         JSR     MAP_IO          ;2 stack
 ;
 ; Since we have only part of a page for stack, we run on the target's
-; stack.  Thus, reset to target SP, rather than our own.
+; stack. Thus, reset to target's SP, rather than our own.
 MA_10   LDX     REG_SP
         TXS
         LDX     #0              ;INIT INPUT BYTE COUNT
@@ -526,11 +532,11 @@ MA_80   JSR     GETCHAR         ;2 stack. GET THE CHECKSUM
         JSR     RESTORE_IO      ;2 stack
 ;
 ; Process the message.
-        LDA     COMBUF+0        ;GET THE FUNCTION CODE
+        LDA     COMBUF+0        ;FUNCTION CODE
         CMP     #FN_GET_STATUS
         BEQ     TARGET_STATUS
         CMP     #FN_READ_MEM
-        BEQ     JREAD_MEM
+        BEQ     READ_MEM
         CMP     #FN_WRITE_MEM
         BEQ     JWRITE_MEM
         CMP     #FN_READ_REGS
@@ -553,7 +559,6 @@ MA_80   JSR     GETCHAR         ;2 stack. GET THE CHECKSUM
         JMP     SEND_STATUS     ;VALUE IS "ERROR"
 ;
 ; long jumps to handlers too far for BEQ
-JREAD_MEM       JMP     READ_MEM
 JWRITE_MEM      JMP     WRITE_MEM
 JREAD_REGS      JMP     READ_REGS
 JWRITE_REGS     JMP     WRITE_REGS
@@ -783,6 +788,9 @@ RUN_TARGET
         LDX     REG_X
         LDY     REG_Y
         LDA     REG_A
+;
+; Arm our NMI debouncer
+        DEC     NMI_NESTING
 ;
 ; Return to user
         RTI
@@ -1018,10 +1026,19 @@ CK_10   CLC
         RTS                     ;return with checksum in A
 
 ;**********************************************************************
-; NMI.
-NMI_HAN JMP     (RAMVEC+0)      ;JUMP THROUGH RAM VECTOR
+; NMI. Enter the monitor, typically by grounding the RESTORE pin
+NMI_HAN
+        INC     NMI_COUNT       ;Total number of NMI seen
+        INC     NMI_NESTING
+        BEQ     NMI_10          ;First NMI: enter the monitor
+        DEC     NMI_NESTING
+        RTI                     ;Ignore nested NMI
+
+NMI_10  STA     REG_A           ;SAVE A
+        LDA     #3
+        JMP     INT_ENTRY       ;ENTER MONITOR: STATE IS "NMI"
 ;
-; IRQ/BREAK.
+; IRQ/BRK interrupt
 ; First, check for BRK (breakpoint) interrupt
 IRQ_HAN STA     REG_A           ;SAVE A
         PLA
@@ -1032,25 +1049,24 @@ IRQ_HAN STA     REG_A           ;SAVE A
         JMP     (RAMVEC+4)      ;JUMP THROUGH RAM VECTOR
 ;
 ; BREAK ENTRY.
-GOBREAKP
-        LDA     #1              ;STATE IS "BREAKPOINT"
-        BRA     GOBREAK         ;COMPLAIN, ENTER MONITOR
+GOBREAKP LDA     #1             ;ENTER MONITOR: STATE IS "BREAKPOINT"
+        BRA     IRQ_90
 ;
 ; IRQ NOT SET BY USER CODE (THIS ADDRESS PLACED IN RAMVEC+04H BY INIT)
-_IRQX   LDA     #2              ;TARGET STOP TYPE
-        BRA     GOBREAK         ;ENTER MONITOR
+UNHAN_IRQ
+        LDA     #2              ;ENTER MONITOR: STATE IS "UNHANDLED IRQ"
 ;
-; NMI NOT SET BY USER CODE (THIS ADDRESS PLACED IN RAMVEC+00H BY INIT)
-_NMIX   LDA     #3              ;TARGET STOP TYPE
-GOBREAK JMP     INT_ENTRY       ;ENTER MONITOR
+; Ignore any NMI that occur while the monitor is active
+IRQ_90  STZ     NMI_NESTING
+        JMP     INT_ENTRY
 
 main_code_end
 ;
 ================================================================================
 ; INTERRUPT VECTORS
         org     $0
-        adr     vec_start       ; Address to load into memory
-        adr     6               ; Length: Math of vec_end - vec_start blows up, since vec_end wraps
+        adr     vec_start       ;Address to load into memory
+        adr     6               ;Length: Math of vec_end - vec_start blows up, since vec_end wraps
 
         org     HARD_VECT
 vec_start
@@ -1060,7 +1076,7 @@ vec_start
 vec_end
 ;
         org     $0
-        adr     boot_start      ; Start address
-        adr     0               ; length of zero means "run me"
+        adr     boot_start      ;Start address
+        adr     0               ;length of zero means "run me"
 
         END     RESET
