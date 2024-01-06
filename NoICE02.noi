@@ -1,0 +1,22 @@
+; The IAR 6502 compiler generates JSR followed by 3 parameter bytes to do
+; banked calls. Un-comment the following lines to use NoICE's CALLSKIP commannd
+; to declare ?BANK_CALL_L20 as a call followed by 3 parameter bytes
+; and ?C_S_SWITCH_L06 as a call that cannot be stepped over.
+;   callskip ?BANK_CALL_L20 3
+;   callskip ?C_S_SWITCH_L06 0
+
+; Foenix F256:
+; The following line defines locations 0 and 1 as pseudo-registers, to show
+; mmu_crtl and io_crtl in the Register window
+; You COULD define pseudo-registers for the LUT values, but they would only
+; be valid when the EDIT bit of mmu_crtl was set.
+defreg mmu_c 0 1
+defreg io_c 1 1
+defreg m0 8 1
+defreg m1 9 1
+defreg m2 $A 1
+defreg m3 $B 1
+defreg m4 $C 1
+defreg m5 $D 1
+defreg m6 $E 1
+defreg m7 $F 1

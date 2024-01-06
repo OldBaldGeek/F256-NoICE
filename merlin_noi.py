@@ -5,7 +5,7 @@
 #
 # Written by John Hartman
 #
-# Version 1.0
+# Version 2.0
 #
 import sys
 import string
@@ -15,60 +15,30 @@ import argparse
 #   bytecount includes address, data, and checksum
 #   checksum is LSB of one's complement of sum of bytecount, address, data, and checksum
 
-# The first-gen monitor locates in RAM at 7F800 - 7FFFF
-# This equate warns for .pgz segments above that range.
-# if the monitor moves, this could be moved to a .ini file, probably along
-# with the memory window address
-monitor_base = 0x7F800
-
-#=============================================================================
-# Convert any address in the paged region into (page,offset)
-def paged_address( a_window, a_address ):
-    if a_address > 0xFFFF:
-        # We generate for an 8K window. Actual window MIGHT be larger
-        page   = a_address >> 13
-        offset = a_window + (a_address & 0x1FFF)
-        a_address = (page << 16) + offset
-
-    return a_address
+# The first-gen "Boot in RAM" monitor locates in RAM at 0F800 - 0FFFF
+# This equate warns for .pgz segments in that range.
+# if the monitor moves, this could be moved to a .ini file
+monitor_base = 0x0F800
+monitor_top  = 0x0FFFF
 
 #=============================================================================
 # Dump a block of data as S-records
-def dump_hex_file( a_outfile, a_window, a_address, a_length, a_offset, a_data ):
-
-    if a_address + a_length >= monitor_base:
+def dump_hex_file( a_outfile, a_address, a_length, a_offset, a_data ):
+    # Default address for PGX, or PGZ without a zero-size segment
+    if (a_address <= monitor_top) and (monitor_base < a_address + a_length):
         print( 'FATAL: Memory segment {addr:06X} {len:04X} overlaps the monitor: not output'.format(addr=a_address, len=a_length) )
         return
 
-    elif a_address > 0xFFFF:
-        # Above 64K
-        if a_window == 0:
-            print( 'Memory segment {addr:06X} {len:04X} is out of range: not output'.format(addr=a_address, len=a_length) )
-            return
-        # We generate for an 8K window. Actual window MIGHT be larger
-        page   = a_address >> 13
-        offset = a_window + (a_address & 0x1FFF)
-        print( 'Memory segment {addr:06X} {len:05X} as paged {page:02X}:{offset:04X}'.format(
-               addr=a_address, len=a_length, page=page, offset=offset) )
-    else:
-        print( 'Memory segment {addr:06X} {len:05X}'.format(addr=a_address, len=a_length) )
+    print( 'Memory segment {addr:06X} {len:05X}'.format(addr=a_address, len=a_length) )
 
     # TODO: NoICE ignores checksum, so for a quick hack we use 00
     if a_length == 0:
         # start address
-        paddr = paged_address(a_window, a_address)
-        if paddr > 0xFFFF:
-            a_outfile.write('S804{addr:06X}00\n'.format(addr=paddr))
-        else:
-            a_outfile.write('S903{addr:04X}00\n'.format(addr=paddr))
+        a_outfile.write('S804{addr:06X}00\n'.format(addr=a_address))
     else:
         while a_length > 0:
-            chunklen = 16 if a_length >= 16 else a_length
-            paddr = paged_address(a_window, a_address)
-            if paddr <= 0xFFFF:
-                str = 'S1{len:02X}{addr:04X}'.format(len=chunklen+3, addr=paddr)
-            else:
-                str = 'S2{len:02X}{addr:06X}'.format(len=chunklen+4, addr=paddr)
+            chunklen = 32 if a_length >= 32 else a_length
+            str = 'S2{len:02X}{addr:06X}'.format(len=chunklen+4, addr=a_address)
 
             for x in range(0, chunklen):
                 str += '{val:02X}'.format(val=a_data[a_offset + x])
@@ -85,14 +55,53 @@ def main():
         'Parse merlin32 assembler output file.pgz and file.pgz_Output.txt' +
         'to extract debug information for use by NoICE.'
     )
-    parser.add_argument('-w', '--window', required=False,
-                        help='is the address of a 8K or larger memory window ' +
-                             'to be used for paged addressing (default=None)')
     parser.add_argument('infile',
                          help='the output pgz or pgx file from merlin32 -V')
     ns = parser.parse_args()
-    print('wtf', ns.infile, ns.window)
-    windowBase = int(ns.window,16) if ns.window != None else 0
+
+    # Dump the code as S-records, and harvest the start address
+    start_address = 0
+    with open(ns.infile,"rb") as codefile:
+        with open(ns.infile + '.s19',"w") as hexfile:
+            data = codefile.read()
+            if data[0] == ord('P'):
+                # PGX: single segment with 32-bit addresses
+                ix = 4   # skip PGX and CPU type bytes
+                segaddr = data[ix+0] + (data[ix+1] << 8) + (data[ix+2] << 16) + (data[ix+3] << 24)
+                seglen  = len(data) - 8
+                ix += 4
+                dump_hex_file( hexfile, segaddr, seglen, ix, data )
+                # Dummy to generate a start-address record for the segment
+                dump_hex_file( hexfile, segaddr, 0, ix, data )
+                start_address = segaddr
+
+            elif data[0] == ord('Z'):
+                # Big Z: multiple segments with 24-bit addresses
+                ix = 1
+                while ix < len(data):
+                    segaddr = data[ix+0] + (data[ix+1] << 8) + (data[ix+2] << 16)
+                    seglen  = data[ix+3] + (data[ix+4] << 8) + (data[ix+5] << 16)
+                    ix += 6
+                    dump_hex_file( hexfile, segaddr, seglen, ix, data )
+                    ix += seglen
+                    if seglen == 0:
+                        start_address = segaddr
+
+            elif data[0] == ord('z'):
+                # Small z: multiple segments with 32-bit addresses
+                ix = 1
+                while ix < len(data):
+                    segaddr = data[ix+0] + (data[ix+1] << 8) + (data[ix+2] << 16) + (data[ix+3] << 24)
+                    seglen  = data[ix+4] + (data[ix+5] << 8) + (data[ix+6] << 16) + (data[ix+7] << 24)
+                    ix += 8
+                    dump_hex_file( hexfile, segaddr, seglen, ix, data )
+                    ix += seglen
+                    if seglen == 0:
+                        start_address = segaddr
+
+            else:
+                print( 'unknown binary file beginning with {data}'.format(data=data[0]))
+
 
     # Generate symbol and source line definitions
     with open(ns.infile + '_Output.txt',"r") as infile:
@@ -177,42 +186,10 @@ def main():
                 outfile.write('endfile\n')
 
             outfile.write('load "{fname}.s19"\n'.format(fname=ns.infile))
+            if start_address != 0:
+                outfile.write('reg pc 0x{val:X}\n'.format(val=start_address))
             outfile.write('mode 2\n')
-
-    # Dump the code
-    with open(ns.infile,"rb") as codefile:
-        with open(ns.infile + '.s19',"w") as hexfile:
-            data = codefile.read()
-            if data[0] == ord('P'):
-                # PGX: single segment with 32-bit addresses
-                ix = 4   # skip PGX and CPU type bytes
-                segaddr = data[ix+0] + (data[ix+1] << 8) + (data[ix+2] << 16) + (data[ix+3] << 24)
-                seglen  = len(data) - 8
-                ix += 4
-                dump_hex_file( hexfile, windowBase, segaddr, seglen, ix, data )
-
-            elif data[0] == ord('Z'):
-                # Big Z: multiple segments with 24-bit addresses
-                ix = 1
-                while ix < len(data):
-                    segaddr = data[ix+0] + (data[ix+1] << 8) + (data[ix+2] << 16)
-                    seglen  = data[ix+3] + (data[ix+4] << 8) + (data[ix+5] << 16)
-                    ix += 6
-                    dump_hex_file( hexfile, windowBase, segaddr, seglen, ix, data )
-                    ix += seglen
-
-            elif data[0] == ord('z'):
-                # Small z: multiple segments with 32-bit addresses
-                ix = 1
-                while ix < len(data):
-                    segaddr = data[ix+0] + (data[ix+1] << 8) + (data[ix+2] << 16) + (data[ix+3] << 24)
-                    seglen  = data[ix+4] + (data[ix+5] << 8) + (data[ix+6] << 16) + (data[ix+7] << 24)
-                    ix += 8
-                    dump_hex_file( hexfile, windowBase, segaddr, seglen, ix, data )
-                    ix += seglen
-
-            else:
-                print( 'unknown binary file beginning with {data}'.format(data=data[0]))
+            outfile.write('s pc')
 
 if __name__ == "__main__":
    main()

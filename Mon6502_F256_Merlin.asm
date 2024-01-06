@@ -1,29 +1,32 @@
 ; 65C02 Debug monitor for Foenix F256jr, for use with NOICE02
 ;
-; Copyright (c) 2023 by John Hartman
+; Copyright (c) 2024 by John Hartman
 ;
 ; Modification History:
-;   8-Dec-23 JLH Ported to run on Foenix F256jr board
+;   4-Jan-2024 JLH Ported to run on Foenix F256jr board
 ;
 ;============================================================================
 ; This file may be assembled with the Merlin32 assembler:
 ;    merlin32 -V Mon6502_Merlin.asm
 ;
 ; This version of the monitor is designed to run in RAM on the F256jr.
-; Run it with
-;    python fnxmgr.zip --run-pgz Mon6502_F256_Merlin.pgz
-;
-; The monitor proper is built at physical address 7/Fxxx.
-; It includes a boot chunk that runs at $0200. This maps the 7/Fxxx code
-; to processor address F800, so that the monitor can access the IRQ/BRK vector,
-; which is used for breakpoints and single-step.
-; It contains code to revector IRQ and NMI interrupts through RAM vectors
+; It is located at physical address 0F8xx so that the monitor can own the
+; reset, IRQ/BRK, and NMI vectors.
+; It contains code to revector IRQ interrupts through RAM vectors
 ; to user code. See RAMVEC below.
+;
+; In must run in the same MMU mapping as the code being debugged, and must
+; remain mapped in MMU bank 7, processor address $E000 to $FFFF.
+;
+; Start the monitor with
+;    python fnxmgr.zip --run-pgz Mon6502_F256_Merlin.pgz
+; This will usually be done by NoICE's Options, Extensions
 ;
 ; To customize for other targets or configurations, refer to the NoICE help
 ; file monitor.htm
 ;
-; This monitor uses no page zero RAM, since it is a scarce resource.
+; This monitor uses no page zero RAM, since that is a scarce resource belonging
+; to the program being debugged.
 ; It tries to minimize stack usage for the same reason. In some cases
 ; this may result in code that looks clunky. See "HACKBUF" below...
 ;
@@ -33,7 +36,7 @@
 ;   and ground (pin 1).
 ;
 ; Information about F256jr ports used here is from f256jr_ref.pdf,
-; dated 11-12-2023. If a later docuement exists, please let me know.
+; dated 31-Jan-2023. If a later docuement exists, please let me know.
 ;
 ;============================================================================
         mx      %11
@@ -42,23 +45,21 @@
         db      'Z'             ;PGZ header upper case Z means 24 bit size/length fields
 
 ; Where in physical RAM to load the monitor
-PAGE_BASE       equ     $7E000
+PAGE_BASE       equ     $0E000
 MAP_PAGE        equ     PAGE_BASE/$2000
 
-RAM_START       EQU     $7F800   ;START OF MONITOR RAM
-CODE_START      EQU     $7F900   ;START OF MONITOR CODE
-HARD_VECT       EQU     $7FFFA   ;START OF HARDWARE VECTORS
+RAM_START       EQU     $0F800   ;START OF MONITOR RAM
+CODE_START      EQU     $0F900   ;START OF MONITOR CODE
+HARD_VECT       EQU     $0FFFA   ;START OF HARDWARE VECTORS
 
-; NoICE supports one "window" for banked memory, while the F256jr has eight 8K
-; windows. This monitor is configured for a NoICE memory window, 8K in size.
-; This is necessary in order to allow NoICE access to all of physical memory.
-; In most cases, this will not affect your code in any way.
+; NoICE supports one "window" for banked memory, while the F256jr has four
+; sets of eight 8K windows. These are so different that we do not use
+; NoICE's memory banking. To load items not mapped into the processor's
+; address space, you will need to use fnxmgr or equivalent.
+; This can often be one using NoICE's Optinos, Extensions for LOAD.
 ;
 ; For more information on NoICE banked memory, refer to the NoICE help
 ; file 2bitmmu.htm
-BANK_LOW        EQU     $A000   ;Bottom of memory window (must be a multiple of 8K)
-BANK_HIGH       EQU     $BFFF   ;top of memory window
-BANK_IN_MMU     equ     BANK_LOW/$2000
 
 ; STACK RAM (PAGE 1)
 ; This monitor uses at most 7 bytes of stack.
@@ -122,57 +123,6 @@ LDAY_OP         equ     $B9     ;LDA AAA,Y
 STAY_OP         equ     $99     ;STA AAA,Y
 CMPY_OP         equ     $D9     ;CMP AAA,Y
 RTS_OP          equ     $60     ;RTS
-
-;============================================================================
-; Bootstrap from low RAM
-        org     $0
-        adr     boot_start              ;Address to load into memory
-        adr     boot_end - boot_start   ;Length of data to load there
-
-        org     $200
-boot_start
-        SEI
-        CLD
-        LDX     #INITSTACK & $FF
-        TXS
-;
-; Map the monitor to $E000 (slot 7) of the current LUT
-        LDA     MMU_MEM_CTRL
-        AND     #MMU_ACT_MASK
-        STA     BOOT_TEMP        ;active MLUT
-        ASL
-        ASL
-        ASL
-        ASL
-        ORA     BOOT_TEMP
-        ORA     #MMU_EDIT_EN    ;Enable MMU edit of the active LUT
-        STA     MMU_MEM_CTRL
-        LDA     #MAP_PAGE
-        STA     MMU_LUTS + 7
-;
-; Map I/O page 0. Turn on SD and Power LEDs, turn off L1 and L0
-        STZ     MMU_IO_CTRL
-        LDA     #$03
-        STA     SYS0
-;
-; Stop blinking L1/L0
-; Manual says L1_MN/L0_MN=0 for manual, but experiment shows 1=manual (hence "_MN")
-        LDA     SYS1
-        ORA     #$03
-        STA     SYS1
-;
-; In some cases, fnxmgr will change the RAM reset vector to boot_start.
-; Restore it to the correct value, so reset will go directly to the monitor.
-        LDA     #RESET & $FF
-        STA     vec_start + 2
-        LDA     #RESET / $100
-        STA     vec_start + 5
-;
-; Jump to the monitor in its newly mapped location
-        JMP     RESET
-
-BOOT_TEMP  DS   0
-boot_end
 
 ;============================================================================
 ; RAM definitions
@@ -249,8 +199,17 @@ RESET
         STZ     NMI_COUNT
 
 ;===========================================================================
-; INITIALIZE F256jr HARDWARE
-        JSR     MAP_IO
+; INITIALIZE F256jr HARDWARE (since we taker control upon reset)
+;
+; Map I/O page 0. Turn on SD and Power LEDs, turn off L1 and L0
+        STZ     MMU_IO_CTRL
+        LDA     #$03
+        STA     SYS0
+;
+; Stop blinking L1/L0
+        LDA     SYS1
+        ORA     #$03
+        STA     SYS1
         STZ     RXWIGGLE
 ;
 ; Initialize 16750 UART
@@ -276,7 +235,6 @@ RESET
 ; Disable all interrupts: modem, receive error, transmit, and receive
         LDA     #$00            ;00000000B
         STA     S16750+IER
-        JSR     RESTORE_IO      ;2 stack
 
 ;===========================================================================
 ; Set interrupt re-vectors to defaults, in case user doesn't set them.
@@ -302,53 +260,12 @@ RESET
         LDA     #$04
         STA     REG_CC          ;interrupts disabled
         STZ     REG_STATE       ;STATE 0 = RESET
-        JSR     SET_MMU         ;2 stack.
-        STA     REG_PAGE        ;Save current MMU content for return with registers
-        JSR     RESTORE_MMU     ;2 stack.
 ;
 ; Set function code for "GO".  Then if we reset after being told to
 ; GO, we will come back with registers so user can see the crash
         LDA     #FN_RUN_TARGET
         STA     COMBUF
         JMP     RETURN_REGS     ;DUMP REGS, ENTER MONITOR
-
-;===========================================================================
-; Save user's MMU setting and enable editing (but don't set LUT)
-;
-; Returns current mapping in A
-;
-; Uses 2 bytes of stack including return address
-;
-SET_MMU
-        LDA     MMU_MEM_CTRL
-        STA     SAVE_MMU_MEM_CTL ;Remember user's setting
-
-        AND     #MMU_ACT_MASK
-        STA     MMU_TEMP        ;active MLUT
-        ASL
-        ASL
-        ASL
-        ASL
-        ORA     MMU_TEMP
-        ORA     #MMU_EDIT_EN    ;Enable MMU edit - we are editing the active
-        STA     MMU_MEM_CTRL
-        LDA     MMU_LUTS + BANK_IN_MMU
-        ; TODO: handle multi-8K window if desired
-        RTS
-
-;===========================================================================
-; Restore user's LUT and MMU settings
-;
-; Uses 2 bytes of stack including return address
-;
-RESTORE_MMU
-        LDA     REG_PAGE
-        STA     MMU_LUTS + BANK_IN_MMU
-        ; TODO: handle multi-8K window if desired
-
-        LDA     SAVE_MMU_MEM_CTL
-        STA     MMU_MEM_CTRL
-        RTS
 
 ;===========================================================================
 ; Save user's I/O configuration and map our I/O, bank 0
@@ -397,7 +314,6 @@ GC_20   LDA     S16750+LSR
         RTS
 ;
 ; Timeout: toggle the power LED as a sign of life, return CY=1
-; Manual says reading SYS0 has only 2 bits. Experiment shows it reads L1,L0,SD,PWR
 GC_90   LDA     SYS0
         AND     #$0E            ;Preserve L1,L0,SD LED states
         ORA     RXWIGGLE
@@ -429,12 +345,12 @@ PC_10   LDA     S16750+LSR      ;CHECK TX STATUS
 TSTG    db      7                   ;2: PROCESSOR TYPE = 65(C)02
         db      COMBUF_SIZE         ;3: SIZE OF COMMUNICATIONS BUFFER
         db      $80                 ;4: has CALL
-        dw      BANK_LOW,BANK_HIGH  ;5-8: LOW AND HIGH LIMIT OF MAPPED MEMORY
+        dw      0,0                 ;5-8: NoICE memory banking not used
         db      B1-B0               ;9 BREAKPOINT INSTR LENGTH
 ;
 ; Define either the BRK or JSR BRKE instruction for use as breakpoint
 B0      db      $00                 ;10+ BREKAPOINT INSTRUCTION (BRK)
-B1      asc     '65C02 monitor for F256jr V3.1' ;DESCRIPTION, ZERO
+B1      asc     '65C02 monitor for F256jr RAM Boot. V3.2' ;DESCRIPTION, ZERO
         db      0
         db      0                   ;page of CALL breakpoint
         dw      B0                  ;address of CALL breakpoint in native order
@@ -599,25 +515,20 @@ READ_MEM
         STA     HACKBUF+0
 ;
 ; Insert address to be read into the instruction in RAM
+; NoICE memory banking is not used
         LDA     COMBUF+3
         STA     HACKBUF+1
         LDA     COMBUF+4
         STA     HACKBUF+2
-        BEQ     RM_10
-;
-; Address is not on page 0: make the MMU visible, set page
-        JSR     SET_MMU                 ;2 stack
-        LDA     COMBUF+2
-        STA     MMU_LUTS + BANK_IN_MMU
 ;
 ; Set return after LDA
-RM_10   LDA     #RTS_OP
+        LDA     #RTS_OP
         STA     HACKBUF+3
 ;
 ; Prepare return buffer: FN (unchanged), LEN, DATA
         LDX     COMBUF+5        ;NUMBER OF BYTES TO GET
         STX     COMBUF+1        ;RETURN LENGTH = REQUESTED DATA
-        BEQ     RM_90           ;JIF NO BYTES TO GET
+        BEQ     RM_99           ;JIF NO BYTES TO GET
 ;
 ; Read the requested bytes from local memory
         LDY     #0              ;INITIAL OFFSET
@@ -627,10 +538,6 @@ RM_20   JSR     HACKBUF         ;GET BYTE AAAA,Y TO A
         DEX
         BNE     RM_20
 ;
-RM_90   LDA     HACKBUF+2
-        BEQ     RM_99
-        JSR     RESTORE_MMU     ;2 stack. Back to user's MMU settings
-  
 ; Compute checksum on buffer, and send to PC, then return
 RM_99   JMP     SEND
 
@@ -647,19 +554,14 @@ WRITE_MEM
         STA     HACKBUF+0
 ;
 ; Set address into RAM
+; NoICE memory banking is not used
         LDA     COMBUF+3
         STA     HACKBUF+1
         LDA     COMBUF+4
         STA     HACKBUF+2
-        BEQ     WM_10
-;
-; Address is not on page 0: make the MMU visible, set page
-        JSR     SET_MMU         ;2 stack
-        LDA     COMBUF+2
-        STA     MMU_LUTS + BANK_IN_MMU
 ;
 ; Set return after LDA
-WM_10   LDA     #RTS_OP
+        LDA     #RTS_OP
         STA     HACKBUF+3
 ;
 ; Prepare return buffer: FN (unchanged), LEN, DATA
@@ -696,19 +598,13 @@ WM_30   LDA     COMBUF+5,Y      ;GET BYTE JUST WRITTEN
 ;
 ; Write succeeded:  return status = 0
 WM_50   LDA     #0              ;RETURN STATUS = 0
-        BRA     WM_90
+        BRA     WM_99
 ;
 ; Write failed:  return status = 1
 WM_80   LDA     #1
 ;
-WM_90   PHA
-        LDA     HACKBUF+2
-        BEQ     WM_99
-        JSR     RESTORE_MMU     ;2 stack. Back to user's MMU settings
-;
 ; Compute checksum on buffer, and send to PC, then return
-WM_99   PLA
-        JMP     SEND_STATUS
+WM_99   JMP     SEND_STATUS
 
 ;===========================================================================
 ;
@@ -752,10 +648,6 @@ WR_10   LDA     COMBUF+2,X      ;GET BYTE TO A
         INX
         DEY
         BNE     WR_10
-;
-; Update the MMU from REG_PAGE just received
-        JSR     SET_MMU         ;2 stack
-        JSR     RESTORE_MMU     ;2 stack
 ;
 ; Force high half of SP, in case user is being mean
 ; Reload SP, in case it has changed
@@ -807,10 +699,6 @@ ENTER_MON
         LDA     #1              ;STACK PAGE ALWAYS 1
         STA     REG_SP+1        ;(ASSUME PAGE 1 STACK)
 ;
-        JSR     SET_MMU         ;2 stack. Make MMU visible
-        STA     REG_PAGE        ;Save current MMU content for return with registers
-        JSR     RESTORE_MMU     ;2 stack. Restore user settings
-;
 ; Return registers to PC
         JMP     RETURN_REGS
 
@@ -839,19 +727,14 @@ SB_10   LDA     #LDA_OP
         STA     HACKBUF+0
 ;
 ; Set address
+; NoICE memory banking is not used
         LDA     COMBUF+3,X
         STA     HACKBUF+1
         LDA     COMBUF+4,X
         STA     HACKBUF+2
-        BEQ     SB_20
-;
-; Address is not on page 0: make the MMU visible, set page
-        JSR     SET_MMU         ;2 stack
-        LDA     COMBUF+2,X
-        STA     MMU_LUTS + BANK_IN_MMU
 ;
 ; Set return after LDA
-SB_20   LDA     #RTS_OP
+        LDA     #RTS_OP
         STA     HACKBUF+3
 ;
 ; Read current data at byte location
@@ -871,12 +754,6 @@ SB_20   LDA     #RTS_OP
         STA     HACKBUF+0
         LDA     COMBUF+5,X
         JSR     HACKBUF
-        PHP                     ;SAVE SUCCESS/FAIL
-;
-SB_40   LDA     HACKBUF+2
-        BEQ     SB_50
-        JSR     RESTORE_MMU     ;2 stack. Back to user's MMU settings
-SB_50   PLP
         BNE     SB_90           ;BR IF INSERT FAILED: ABORT AT Y BYTES
 ;
 ; Loop for next byte
@@ -979,14 +856,14 @@ SEND_STATUS
 ; If called, uses 5 bytes of stack including return address
 ; If jumped to (normal case), uses 3 bytes of stack
 ;
-SEND    JSR     MAP_IO          ;2 stack. Save user's I/O mapping, enable ours
-        JSR     CHECKSUM        ;2 stack. GET A=CHECKSUM, X->checksum location
+SEND    JSR     CHECKSUM        ;2 stack. GET A=CHECKSUM, X->checksum location
         EOR     #$FF
         CLC
         ADC     #1
         STA     COMBUF,X        ;STORE NEGATIVE OF CHECKSUM
 ;
 ; Send buffer to PC
+        JSR     MAP_IO          ;2 stack. Save user's I/O mapping, enable ours
         LDX     #0              ;POINTER TO DATA
         LDY     COMBUF+1        ;LENGTH OF DATA
         INY                     ;PLUS FUNCTION, LENGTH, CHECKSUM
@@ -1076,7 +953,7 @@ vec_start
 vec_end
 ;
         org     $0
-        adr     boot_start      ;Start address
+        adr     RESET           ;Start address
         adr     0               ;length of zero means "run me"
 
         END     RESET
